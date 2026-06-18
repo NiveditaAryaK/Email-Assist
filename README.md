@@ -1,6 +1,6 @@
 # Email Assist
 
-Local-first important mail queue. You enter what matters, it syncs recent email over IMAP, scores messages with those priorities, saves the important ones to SQLite, and shows them in a small dashboard. Click any captured message to open the original in Gmail; use `stored text` as a local fallback.
+Local-first important mail queue. You add what matters as priority chips, it syncs recent email over IMAP, scores messages with those priorities and synonym-expanded keywords, saves the important ones to SQLite, and shows them in a small dashboard. Click any captured message to open the original in Gmail; use `stored text` as a local fallback.
 
 This is intentionally not an AI agent yet. The first useful version should reliably answer: "what mail should I not miss?"
 
@@ -18,9 +18,16 @@ Use the dashboard's Priorities page to enter your own priorities.
 
 - Python 3
 - IMAP access for your email account
-- No Python packages to install
+- Optional: NLTK for WordNet synonym expansion
 
 For Gmail, use an app password. Do not put your normal Google password in `.env`.
+
+To enable NLTK synonyms:
+
+```bash
+python3 -m pip install -r requirements.txt
+python3 -m nltk.downloader wordnet
+```
 
 ## Quick Start
 
@@ -43,7 +50,7 @@ Open:
 http://127.0.0.1:8765
 ```
 
-Then open `Priorities`, put one priority per line, and save. Higher lines get higher score.
+Add priorities from the main page. Each priority becomes a chip you can remove.
 
 ## Sync Real Email
 
@@ -65,7 +72,7 @@ python3 email_assist.py serve
 
 ## Rules
 
-The dashboard writes [rules.json](rules.json) for you. Each priority line becomes a JSON rule with a label, score, and regex pattern:
+The dashboard writes [rules.json](rules.json) for you. Each priority chip becomes a JSON rule with a label, score, and regex patterns:
 
 ```json
 {
@@ -75,7 +82,7 @@ The dashboard writes [rules.json](rules.json) for you. Each priority line become
 }
 ```
 
-Higher scores appear first. Messages that match no rule are ignored. You can still edit [rules.json](rules.json) directly if you want regex control. After sync, click a message subject in the queue to open Gmail on that message.
+Higher scores appear first. Messages that match no rule are ignored. If NLTK WordNet is installed, each priority is expanded with synonyms too. You can still edit [rules.json](rules.json) directly if you want regex control. After sync, click a message subject in the queue to open Gmail on that message.
 
 ## Files
 
@@ -97,7 +104,7 @@ python3 test_email_assist.py
 
 - IMAP only; no Gmail OAuth yet
 - rules-based scoring only; no LLM classification yet
-- priority lines match exact phrases unless you edit `rules.json`
+- NLTK synonyms are optional and depend on local WordNet data
 - local dashboard only; no hosted multi-user app yet
 - simple `.env` parser; use plain `KEY=value` lines
 

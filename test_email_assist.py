@@ -41,8 +41,13 @@ def test_priorities_become_ordered_rules():
     assert "transaction" in rules[1]["patterns"]
 
 
+def test_missing_nltk_is_not_fatal():
+    assert isinstance(email_assist.nltk_synonyms("interview"), list)
+
+
 if __name__ == "__main__":
     test_interview_message_is_important()
     test_load_env_sets_missing_values_only()
     test_priorities_become_ordered_rules()
+    test_missing_nltk_is_not_fatal()
     print("ok")

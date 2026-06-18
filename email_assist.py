@@ -29,6 +29,7 @@ EXPANSIONS = {
     "invoice": ["invoice", "receipt", "payment due", "paid", "billing"],
     "deadline": ["deadline", "urgent", "action required", "expires", "final reminder"],
 }
+MAX_SYNONYMS_PER_WORD = 12
 
 
 def load_env(path=ENV):
@@ -80,6 +81,10 @@ def priorities_from_rules(rules):
     return "\n".join(rule["label"] for rule in rules)
 
 
+def load_priority_labels():
+    return [rule["label"] for rule in load_rules()]
+
+
 def rules_from_priorities(text):
     priorities = []
     seen = set()
@@ -103,13 +108,53 @@ def priority_patterns(label):
     for word in words:
         if word in STOPWORDS:
             continue
-        for pattern in EXPANSIONS.get(word, [word]):
+        expanded = EXPANSIONS.get(word, [word]) + nltk_synonyms(word)
+        for pattern in expanded:
             patterns.add(re.escape(pattern))
     return sorted(patterns)
 
 
+def nltk_synonyms(word):
+    try:
+        from nltk.corpus import wordnet
+        synsets = wordnet.synsets(word)
+    except (ImportError, LookupError):
+        return []
+    synonyms = []
+    seen = {word}
+    for synset in synsets:
+        for lemma in synset.lemma_names():
+            candidate = lemma.replace("_", " ").lower()
+            if candidate in seen or candidate in STOPWORDS:
+                continue
+            seen.add(candidate)
+            synonyms.append(candidate)
+            if len(synonyms) >= MAX_SYNONYMS_PER_WORD:
+                return synonyms
+    return synonyms
+
+
 def save_rules(rules, path=RULES):
     path.write_text(json.dumps({"rules": rules}, indent=2) + "\n")
+
+
+def save_priority_labels(labels):
+    rules = rules_from_priorities("\n".join(labels))
+    save_rules(rules)
+    rescore_messages(rules)
+
+
+def add_priority(label):
+    labels = load_priority_labels()
+    key = label.strip().lower()
+    if key and key not in {item.lower() for item in labels}:
+        labels.append(label.strip())
+        save_priority_labels(labels)
+
+
+def delete_priority(label):
+    labels = [item for item in load_priority_labels() if item.lower() != label.strip().lower()]
+    save_priority_labels(labels)
 
 
 def gmail_url(message_id):
@@ -310,7 +355,6 @@ def get_message(message_id):
 
 def app_shell(title, active, content):
     queue_class = "active" if active == "queue" else ""
-    priorities_class = "active" if active == "priorities" else ""
     return f"""<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -368,6 +412,33 @@ nav a.active {{ background: var(--brand); border-color: var(--brand); color: whi
   gap: 14px;
   align-items: end;
   margin-bottom: 14px;
+}}
+.priority-panel {{ margin-bottom: 14px; }}
+.priority-form {{ display: flex; gap: 8px; margin-top: 12px; }}
+.chips {{ display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }}
+.chip {{
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 1px solid #a8d4df;
+  border-radius: 999px;
+  background: var(--brand-soft);
+  color: #0f536b;
+  padding: 4px 8px 4px 12px;
+}}
+.chip form {{ margin: 0; }}
+.chip button {{
+  width: 22px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  border-radius: 999px;
+  padding: 0;
+  background: white;
+  color: #0f536b;
+  border-color: #a8d4df;
+  line-height: 1;
 }}
 .search {{ display: flex; gap: 8px; min-width: 0; }}
 input, textarea, button {{
@@ -445,7 +516,7 @@ article.mail {{
 .saved {{ color: var(--ok); font-weight: 600; }}
 @media (max-width: 720px) {{
   .app {{ padding: 16px; }}
-  .topbar, .toolbar {{ display: grid; grid-template-columns: 1fr; align-items: stretch; }}
+  .topbar, .toolbar, .priority-form {{ display: grid; grid-template-columns: 1fr; align-items: stretch; }}
   .stats {{ grid-template-columns: 1fr; }}
   article.mail {{ grid-template-columns: 1fr; }}
   .search {{ display: grid; grid-template-columns: 1fr; }}
@@ -460,7 +531,6 @@ article.mail {{
     </div>
     <nav aria-label="Primary">
       <a class="{queue_class}" href="/">Queue</a>
-      <a class="{priorities_class}" href="/priorities">Priorities</a>
     </nav>
   </header>
   {content}
@@ -492,6 +562,12 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/priorities":
             self.save_priorities()
             return
+        if parsed.path == "/priority/add":
+            self.add_priority()
+            return
+        if parsed.path == "/priority/delete":
+            self.delete_priority()
+            return
         self.send_error(404)
 
     def mark_done(self):
@@ -510,13 +586,29 @@ class Handler(BaseHTTPRequestHandler):
         rules = rules_from_priorities(text)
         save_rules(rules)
         rescore_messages(rules)
+        self.redirect("/")
+
+    def add_priority(self):
+        length = int(self.headers.get("content-length", "0"))
+        label = parse_qs(self.rfile.read(length).decode()).get("priority", [""])[0]
+        add_priority(label)
+        self.redirect("/")
+
+    def delete_priority(self):
+        length = int(self.headers.get("content-length", "0"))
+        label = parse_qs(self.rfile.read(length).decode()).get("priority", [""])[0]
+        delete_priority(label)
+        self.redirect("/")
+
+    def redirect(self, location):
         self.send_response(303)
-        self.send_header("Location", "/priorities?saved=1")
+        self.send_header("Location", location)
         self.end_headers()
 
     def page(self, status, q):
         items = rows(status, q)
         counts = status_counts()
+        priorities = priority_chips(load_priority_labels())
         new_active = "active" if status == "new" else ""
         done_active = "active" if status == "done" else ""
         body = "".join(card(row) for row in items) or '<div class="empty">No matching mail.</div>'
@@ -525,6 +617,15 @@ class Handler(BaseHTTPRequestHandler):
   <div class="stat"><strong>{counts.get('new', 0)}</strong><span>Needs review</span></div>
   <div class="stat"><strong>{counts.get('done', 0)}</strong><span>Done</span></div>
   <div class="stat"><strong>{counts.get('new', 0) + counts.get('done', 0)}</strong><span>Total captured</span></div>
+</section>
+<section class="panel priority-panel">
+  <h2>Priorities</h2>
+  <p class="hint">Add what matters. NLTK WordNet synonyms are used when installed, then current mail is rescored.</p>
+  <div class="chips">{priorities or '<span class="hint">No priorities yet.</span>'}</div>
+  <form class="priority-form" method="post" action="/priority/add">
+    <input name="priority" placeholder="Add priority, e.g. bank alerts, interviews, visa appointment" autocomplete="off">
+    <button>Add</button>
+  </form>
 </section>
 <section class="panel">
   <div class="toolbar">
@@ -615,6 +716,19 @@ def card(row):
     <button class="button-secondary">Done</button>
   </form>
 </article>"""
+
+
+def priority_chips(labels):
+    chips = []
+    for label in labels:
+        escaped = html.escape(label)
+        chips.append(f"""<span class="chip">{escaped}
+  <form method="post" action="/priority/delete">
+    <input type="hidden" name="priority" value="{escaped}">
+    <button aria-label="Remove {escaped}" title="Remove">x</button>
+  </form>
+</span>""")
+    return "".join(chips)
 
 
 def serve(port):

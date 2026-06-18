@@ -4,10 +4,13 @@
       "label": "interview",
       "score": 2,
       "patterns": [
+        "audience",
         "calendar\\ invite",
+        "consultation",
         "hiring",
         "interview",
         "offer\\ letter",
+        "question",
         "recruiter",
         "scheduled"
       ]
@@ -16,6 +19,8 @@
       "label": "hr",
       "score": 1,
       "patterns": [
+        "60\\ minutes",
+        "hour",
         "hr"
       ]
     }
