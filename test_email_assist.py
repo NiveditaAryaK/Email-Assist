@@ -31,7 +31,16 @@ def test_load_env_sets_missing_values_only():
         assert os.environ["EMAIL_IMAP_USER"] == "shell@example.com"
 
 
+def test_priorities_become_ordered_rules():
+    rules = email_assist.rules_from_priorities("Interview scheduled\nBank alerts\nInterview scheduled\n")
+    assert [rule["label"] for rule in rules] == ["Interview scheduled", "Bank alerts"]
+    assert [rule["score"] for rule in rules] == [2, 1]
+    assert "recruiter" in rules[0]["patterns"]
+    assert "transaction" in rules[1]["patterns"]
+
+
 if __name__ == "__main__":
     test_interview_message_is_important()
     test_load_env_sets_missing_values_only()
+    test_priorities_become_ordered_rules()
     print("ok")

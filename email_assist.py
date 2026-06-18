@@ -7,7 +7,6 @@ import json
 import os
 import re
 import sqlite3
-from contextlib import closing
 from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -18,6 +17,18 @@ from urllib.parse import parse_qs, urlparse
 DB = Path(os.environ.get("EMAIL_ASSIST_DB", "email_assist.sqlite3"))
 RULES = Path(os.environ.get("EMAIL_ASSIST_RULES", "rules.json"))
 ENV = Path(os.environ.get("EMAIL_ASSIST_ENV", ".env"))
+STOPWORDS = {
+    "a", "an", "and", "any", "for", "from", "his", "her", "important", "mail", "mails",
+    "me", "my", "of", "or", "the", "to", "with",
+}
+EXPANSIONS = {
+    "bank": ["bank", "credit card", "debit card", "statement", "transaction", "otp", "payment"],
+    "interview": ["interview", "recruiter", "hiring", "calendar invite", "scheduled", "offer letter"],
+    "job": ["job", "interview", "recruiter", "hiring", "offer letter", "application"],
+    "visa": ["visa", "appointment", "consulate", "embassy", "passport"],
+    "invoice": ["invoice", "receipt", "payment due", "paid", "billing"],
+    "deadline": ["deadline", "urgent", "action required", "expires", "final reminder"],
+}
 
 
 def load_env(path=ENV):
@@ -58,6 +69,42 @@ def load_rules(path=RULES):
     with path.open() as f:
         data = json.load(f)
     return data.get("rules", [])
+
+
+def priorities_from_rules(rules):
+    return "\n".join(rule["label"] for rule in rules)
+
+
+def rules_from_priorities(text):
+    priorities = []
+    seen = set()
+    for line in text.splitlines():
+        label = re.sub(r"\s+", " ", line).strip()
+        key = label.lower()
+        if not label or key in seen:
+            continue
+        seen.add(key)
+        priorities.append(label)
+    total = len(priorities)
+    return [
+        {"label": label, "score": total - index, "patterns": priority_patterns(label)}
+        for index, label in enumerate(priorities)
+    ]
+
+
+def priority_patterns(label):
+    patterns = {re.escape(label)}
+    words = re.findall(r"[a-z0-9]+", label.lower())
+    for word in words:
+        if word in STOPWORDS:
+            continue
+        for pattern in EXPANSIONS.get(word, [word]):
+            patterns.add(re.escape(pattern))
+    return sorted(patterns)
+
+
+def save_rules(rules, path=RULES):
+    path.write_text(json.dumps({"rules": rules}, indent=2) + "\n")
 
 
 def clean_header(value):
@@ -149,6 +196,17 @@ def save_messages(db, messages):
     db.commit()
 
 
+def rescore_messages(rules):
+    with connect() as db:
+        for row in db.execute("select id, sender, subject, snippet from messages").fetchall():
+            labels, score = classify(row, rules)
+            db.execute(
+                "update messages set labels = ?, score = ? where id = ?",
+                [json.dumps(labels), score, row["id"]],
+            )
+        db.commit()
+
+
 def sync_imap(limit):
     load_env()
     host = os.environ.get("EMAIL_IMAP_HOST")
@@ -159,7 +217,8 @@ def sync_imap(limit):
         raise SystemExit("Set EMAIL_IMAP_HOST, EMAIL_IMAP_USER, and EMAIL_IMAP_PASSWORD.")
 
     rules = load_rules()
-    with closing(imaplib.IMAP4_SSL(host)) as client:
+    client = imaplib.IMAP4_SSL(host)
+    try:
         client.login(user, password)
         client.select(folder)
         typ, data = client.search(None, "ALL")
@@ -171,6 +230,7 @@ def sync_imap(limit):
             typ, fetched = client.fetch(msg_id, "(RFC822)")
             if typ == "OK" and fetched and isinstance(fetched[0], tuple):
                 messages.append(parse_message(fetched[0][1], rules))
+    finally:
         client.logout()
 
     with connect() as db:
@@ -213,7 +273,7 @@ EMAIL_IMAP_FOLDER=INBOX
 
 
 def rows(status="new", q=""):
-    sql = "select * from messages where status = ?"
+    sql = "select * from messages where status = ? and score > 0"
     args = [status]
     if q:
         sql += " and (sender like ? or subject like ? or snippet like ? or labels like ?)"
@@ -223,6 +283,158 @@ def rows(status="new", q=""):
         return db.execute(sql, args).fetchall()
 
 
+def status_counts():
+    with connect() as db:
+        return dict(db.execute("select status, count(*) from messages group by status").fetchall())
+
+
+def app_shell(title, active, content):
+    queue_class = "active" if active == "queue" else ""
+    priorities_class = "active" if active == "priorities" else ""
+    return f"""<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>
+:root {{
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --text: #17202a;
+  --muted: #667085;
+  --line: #d8dee6;
+  --brand: #176b87;
+  --brand-soft: #e3f3f7;
+  --accent: #8a5a20;
+  --ok: #287a4d;
+}}
+* {{ box-sizing: border-box; }}
+body {{
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}}
+.app {{ max-width: 1120px; margin: 0 auto; padding: 24px; }}
+.topbar {{
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 24px;
+}}
+.brand h1 {{ margin: 0; font-size: 24px; line-height: 1.1; }}
+.brand p {{ margin: 5px 0 0; color: var(--muted); }}
+nav {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+nav a {{
+  color: var(--text);
+  text-decoration: none;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  padding: 8px 12px;
+  border-radius: 8px;
+}}
+nav a.active {{ background: var(--brand); border-color: var(--brand); color: white; }}
+.panel {{
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 18px;
+}}
+.toolbar {{
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 14px;
+  align-items: end;
+  margin-bottom: 14px;
+}}
+.search {{ display: flex; gap: 8px; min-width: 0; }}
+input, textarea, button {{
+  font: inherit;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}}
+input, textarea {{ background: white; color: var(--text); padding: 10px 12px; }}
+input {{ width: 100%; min-width: 180px; }}
+textarea {{ width: 100%; min-height: 300px; resize: vertical; }}
+button {{
+  background: var(--brand);
+  border-color: var(--brand);
+  color: white;
+  padding: 10px 14px;
+  cursor: pointer;
+  white-space: nowrap;
+}}
+.button-secondary {{ background: white; color: var(--text); border-color: var(--line); }}
+.tabs {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+.tab {{
+  color: var(--text);
+  text-decoration: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: white;
+}}
+.tab.active {{ background: var(--brand-soft); border-color: #a8d4df; color: #0f536b; }}
+.stats {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }}
+.stat {{ background: #fbfcfd; border: 1px solid var(--line); border-radius: 8px; padding: 12px; }}
+.stat strong {{ display: block; font-size: 24px; line-height: 1.1; }}
+.stat span {{ color: var(--muted); font-size: 13px; }}
+.mail-list {{ display: grid; gap: 10px; }}
+article.mail {{
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--brand);
+  border-radius: 8px;
+  background: white;
+  padding: 14px;
+}}
+.mail h2 {{ margin: 0 0 6px; font-size: 17px; line-height: 1.25; overflow-wrap: anywhere; }}
+.meta {{ color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }}
+.snippet {{ margin: 10px 0; color: #394655; }}
+.labels {{ display: flex; gap: 6px; flex-wrap: wrap; }}
+.label, .score {{
+  display: inline-flex;
+  align-items: center;
+  min-height: 24px;
+  border-radius: 999px;
+  padding: 3px 8px;
+  font-size: 12px;
+}}
+.label {{ background: var(--brand-soft); color: #0f536b; }}
+.score {{ background: #fff2d6; color: var(--accent); margin-left: 6px; }}
+.empty {{ color: var(--muted); padding: 28px; text-align: center; border: 1px dashed var(--line); border-radius: 8px; background: #fbfcfd; }}
+.hint {{ color: var(--muted); margin-top: 0; }}
+.save-row {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }}
+.saved {{ color: var(--ok); font-weight: 600; }}
+@media (max-width: 720px) {{
+  .app {{ padding: 16px; }}
+  .topbar, .toolbar {{ display: grid; grid-template-columns: 1fr; align-items: stretch; }}
+  .stats {{ grid-template-columns: 1fr; }}
+  article.mail {{ grid-template-columns: 1fr; }}
+  .search {{ display: grid; grid-template-columns: 1fr; }}
+  nav a, .tab, button {{ text-align: center; }}
+}}
+</style>
+<main class="app">
+  <header class="topbar">
+    <div class="brand">
+      <h1>Email Assist</h1>
+      <p>{html.escape(title)}</p>
+    </div>
+    <nav aria-label="Primary">
+      <a class="{queue_class}" href="/">Queue</a>
+      <a class="{priorities_class}" href="/priorities">Priorities</a>
+    </nav>
+  </header>
+  {content}
+</main>
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -230,13 +442,22 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             self.page(qs.get("status", ["new"])[0], qs.get("q", [""])[0])
             return
+        if parsed.path == "/priorities":
+            self.priorities_page()
+            return
         self.send_error(404)
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path != "/done":
-            self.send_error(404)
+        if parsed.path == "/done":
+            self.mark_done()
             return
+        if parsed.path == "/priorities":
+            self.save_priorities()
+            return
+        self.send_error(404)
+
+    def mark_done(self):
         length = int(self.headers.get("content-length", "0"))
         item = parse_qs(self.rfile.read(length).decode()).get("id", [""])[0]
         with connect() as db:
@@ -246,34 +467,67 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Location", "/")
         self.end_headers()
 
+    def save_priorities(self):
+        length = int(self.headers.get("content-length", "0"))
+        text = parse_qs(self.rfile.read(length).decode()).get("priorities", [""])[0]
+        rules = rules_from_priorities(text)
+        save_rules(rules)
+        rescore_messages(rules)
+        self.send_response(303)
+        self.send_header("Location", "/priorities?saved=1")
+        self.end_headers()
+
     def page(self, status, q):
         items = rows(status, q)
-        body = "".join(card(row) for row in items) or "<p>No matching mail.</p>"
-        doc = f"""<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Email Assist</title>
-<style>
-body {{ font: 16px/1.4 system-ui, sans-serif; max-width: 920px; margin: 32px auto; padding: 0 16px; color: #1f2933; }}
-header {{ display: flex; gap: 12px; justify-content: space-between; align-items: center; flex-wrap: wrap; }}
-form.search {{ display: flex; gap: 8px; }}
-input, button {{ font: inherit; padding: 8px 10px; }}
-article {{ border: 1px solid #ccd3db; border-radius: 8px; padding: 14px; margin: 12px 0; }}
-.meta {{ color: #5b6673; font-size: 14px; }}
-.labels {{ margin-top: 8px; }}
-.label {{ background: #e7eef8; border-radius: 999px; padding: 3px 8px; font-size: 13px; margin-right: 6px; }}
-.done {{ float: right; }}
-</style>
-<header>
-  <h1>Important mail</h1>
-  <form class="search" method="get">
-    <input name="q" value="{html.escape(q)}" placeholder="Ask/search: interview, bank, deadline">
-    <button>Search</button>
-  </form>
-</header>
-{body}
+        counts = status_counts()
+        new_active = "active" if status == "new" else ""
+        done_active = "active" if status == "done" else ""
+        body = "".join(card(row) for row in items) or '<div class="empty">No matching mail.</div>'
+        content = f"""
+<section class="stats" aria-label="Queue summary">
+  <div class="stat"><strong>{counts.get('new', 0)}</strong><span>Needs review</span></div>
+  <div class="stat"><strong>{counts.get('done', 0)}</strong><span>Done</span></div>
+  <div class="stat"><strong>{counts.get('new', 0) + counts.get('done', 0)}</strong><span>Total captured</span></div>
+</section>
+<section class="panel">
+  <div class="toolbar">
+    <div class="tabs" aria-label="Status">
+      <a class="tab {new_active}" href="/">Needs review</a>
+      <a class="tab {done_active}" href="/?status=done">Done</a>
+    </div>
+    <form class="search" method="get">
+      <input type="hidden" name="status" value="{html.escape(status)}">
+      <input name="q" value="{html.escape(q)}" placeholder="Search sender, subject, label">
+      <button>Search</button>
+    </form>
+  </div>
+  <div class="mail-list">{body}</div>
+</section>
 """
+        doc = app_shell("Important mail queue", "queue", content)
+        self.send_response(200)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(doc.encode())
+
+    def priorities_page(self):
+        saved = "saved=1" in self.path
+        priorities = html.escape(priorities_from_rules(load_rules()))
+        saved_message = '<span class="saved">Saved</span>' if saved else ""
+        content = f"""
+<section class="panel">
+  <h2>Priority order</h2>
+  <p class="hint">Put one priority per line. Higher lines sort higher after the next sync.</p>
+  <form method="post" action="/priorities">
+    <textarea name="priorities" spellcheck="true">{priorities}</textarea>
+    <div class="save-row">
+      <button>Save priorities</button>
+      {saved_message}
+    </div>
+  </form>
+</section>
+"""
+        doc = app_shell("Choose what should not be missed", "priorities", content)
         self.send_response(200)
         self.send_header("content-type", "text/html; charset=utf-8")
         self.end_headers()
@@ -282,12 +536,17 @@ article {{ border: 1px solid #ccd3db; border-radius: 8px; padding: 14px; margin:
 
 def card(row):
     labels = "".join(f'<span class="label">{html.escape(label)}</span>' for label in json.loads(row["labels"]))
-    return f"""<article>
-  <form class="done" method="post" action="/done"><input type="hidden" name="id" value="{html.escape(row['id'])}"><button>Done</button></form>
-  <h2>{html.escape(row['subject'])}</h2>
-  <div class="meta">{html.escape(row['sender'])} | {html.escape(row['sent_at'])} | score {row['score']}</div>
-  <p>{html.escape(row['snippet'])}</p>
-  <div class="labels">{labels}</div>
+    return f"""<article class="mail">
+  <div>
+    <h2>{html.escape(row['subject'])}</h2>
+    <div class="meta">{html.escape(row['sender'])} · {html.escape(row['sent_at'])}<span class="score">score {row['score']}</span></div>
+    <p class="snippet">{html.escape(row['snippet'])}</p>
+    <div class="labels">{labels}</div>
+  </div>
+  <form method="post" action="/done">
+    <input type="hidden" name="id" value="{html.escape(row['id'])}">
+    <button class="button-secondary">Done</button>
+  </form>
 </article>"""
 
 

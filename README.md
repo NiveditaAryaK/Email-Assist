@@ -1,6 +1,6 @@
 # Email Assist
 
-Local-first important mail queue. It syncs recent email over IMAP, scores messages with your own rules, saves the important ones to SQLite, and shows them in a small dashboard.
+Local-first important mail queue. You enter what matters, it syncs recent email over IMAP, scores messages with those priorities, saves the important ones to SQLite, and shows them in a small dashboard.
 
 This is intentionally not an AI agent yet. The first useful version should reliably answer: "what mail should I not miss?"
 
@@ -12,7 +12,7 @@ Default rules look for:
 - interviews: recruiter messages, scheduled interviews, calendar invites, offer letters
 - deadlines: urgent/action-required/final-reminder messages
 
-Edit [rules.json](rules.json) to match your own priorities.
+Use the dashboard's Priorities page to enter your own priorities.
 
 ## Requirements
 
@@ -43,6 +43,8 @@ Open:
 http://127.0.0.1:8765
 ```
 
+Then open `Priorities`, put one priority per line, and save. Higher lines get higher score.
+
 ## Sync Real Email
 
 Fill in `.env`:
@@ -63,7 +65,7 @@ python3 email_assist.py serve
 
 ## Rules
 
-Rules are JSON objects with a label, score, and regex patterns:
+The dashboard writes [rules.json](rules.json) for you. Each priority line becomes a JSON rule with a label, score, and regex pattern:
 
 ```json
 {
@@ -73,7 +75,7 @@ Rules are JSON objects with a label, score, and regex patterns:
 }
 ```
 
-Higher scores appear first. Messages that match no rule are ignored.
+Higher scores appear first. Messages that match no rule are ignored. You can still edit [rules.json](rules.json) directly if you want regex control.
 
 ## Files
 
@@ -95,6 +97,7 @@ python3 test_email_assist.py
 
 - IMAP only; no Gmail OAuth yet
 - rules-based scoring only; no LLM classification yet
+- priority lines match exact phrases unless you edit `rules.json`
 - local dashboard only; no hosted multi-user app yet
 - simple `.env` parser; use plain `KEY=value` lines
 
