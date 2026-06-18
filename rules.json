@@ -1,0 +1,39 @@
+{
+  "rules": [
+    {
+      "label": "bank",
+      "score": 5,
+      "patterns": [
+        "\\bbank\\b",
+        "credit card",
+        "debit card",
+        "statement",
+        "transaction",
+        "otp"
+      ]
+    },
+    {
+      "label": "interview",
+      "score": 8,
+      "patterns": [
+        "interview",
+        "recruiter",
+        "hiring",
+        "calendar invite",
+        "scheduled",
+        "offer letter"
+      ]
+    },
+    {
+      "label": "deadline",
+      "score": 4,
+      "patterns": [
+        "urgent",
+        "action required",
+        "deadline",
+        "expires",
+        "final reminder"
+      ]
+    }
+  ]
+}
