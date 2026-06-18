@@ -1,17 +1,22 @@
 {
   "rules": [
     {
-      "label": "calendar",
+      "label": "interview",
       "score": 2,
       "patterns": [
-        "calendar"
+        "calendar\\ invite",
+        "hiring",
+        "interview",
+        "offer\\ letter",
+        "recruiter",
+        "scheduled"
       ]
     },
     {
-      "label": "reddit",
+      "label": "hr",
       "score": 1,
       "patterns": [
-        "reddit"
+        "hr"
       ]
     }
   ]

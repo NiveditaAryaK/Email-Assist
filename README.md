@@ -1,6 +1,6 @@
 # Email Assist
 
-Local-first important mail queue. You enter what matters, it syncs recent email over IMAP, scores messages with those priorities, saves the important ones to SQLite, and shows them in a small dashboard.
+Local-first important mail queue. You enter what matters, it syncs recent email over IMAP, scores messages with those priorities, saves the important ones to SQLite, and shows them in a small dashboard. Click any captured message to open the original in Gmail; use `stored text` as a local fallback.
 
 This is intentionally not an AI agent yet. The first useful version should reliably answer: "what mail should I not miss?"
 
@@ -75,14 +75,14 @@ The dashboard writes [rules.json](rules.json) for you. Each priority line become
 }
 ```
 
-Higher scores appear first. Messages that match no rule are ignored. You can still edit [rules.json](rules.json) directly if you want regex control.
+Higher scores appear first. Messages that match no rule are ignored. You can still edit [rules.json](rules.json) directly if you want regex control. After sync, click a message subject in the queue to open Gmail on that message.
 
 ## Files
 
 - `email_assist.py`: app, sync, dashboard
 - `rules.json`: your local priority rules
 - `.env`: your local email config, ignored by git
-- `email_assist.sqlite3`: local message database, ignored by git
+- `email_assist.sqlite3`: local message database with captured message text, ignored by git
 - `test_email_assist.py`: small self-check
 
 ## Check

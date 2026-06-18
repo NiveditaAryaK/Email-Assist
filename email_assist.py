@@ -12,7 +12,7 @@ from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 DB = Path(os.environ.get("EMAIL_ASSIST_DB", "email_assist.sqlite3"))
 RULES = Path(os.environ.get("EMAIL_ASSIST_RULES", "rules.json"))
@@ -60,6 +60,11 @@ def connect():
             url text not null default ''
         )
     """)
+    columns = {row["name"] for row in db.execute("pragma table_info(messages)")}
+    if "body" not in columns:
+        db.execute("alter table messages add column body text not null default ''")
+        db.execute("update messages set body = snippet where body = ''")
+        db.commit()
     return db
 
 
@@ -105,6 +110,13 @@ def priority_patterns(label):
 
 def save_rules(rules, path=RULES):
     path.write_text(json.dumps({"rules": rules}, indent=2) + "\n")
+
+
+def gmail_url(message_id):
+    message_id = (message_id or "").strip().strip("<>")
+    if not message_id:
+        return ""
+    return "https://mail.google.com/mail/u/0/#search/" + quote(f"rfc822msgid:{message_id}", safe="")
 
 
 def clean_header(value):
@@ -160,7 +172,8 @@ def parse_message(raw, rules):
         "subject": clean_header(msg.get("subject")),
         "sent_at": sent.astimezone(timezone.utc).isoformat(),
         "snippet": text[:500],
-        "url": "",
+        "body": text,
+        "url": gmail_url(msg.get("message-id")),
     }
     labels, score = classify(mail, rules)
     mail["labels"] = labels
@@ -173,13 +186,14 @@ def save_messages(db, messages):
         if mail["score"] <= 0:
             continue
         db.execute("""
-            insert into messages (id, sender, subject, sent_at, snippet, labels, score, url)
-            values (?, ?, ?, ?, ?, ?, ?, ?)
+            insert into messages (id, sender, subject, sent_at, snippet, body, labels, score, url)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
             on conflict(id) do update set
                 sender=excluded.sender,
                 subject=excluded.subject,
                 sent_at=excluded.sent_at,
                 snippet=excluded.snippet,
+                body=excluded.body,
                 labels=excluded.labels,
                 score=excluded.score,
                 url=excluded.url
@@ -189,6 +203,7 @@ def save_messages(db, messages):
             mail["subject"],
             mail["sent_at"],
             mail["snippet"],
+            mail["body"],
             json.dumps(mail["labels"]),
             mail["score"],
             mail["url"],
@@ -286,6 +301,11 @@ def rows(status="new", q=""):
 def status_counts():
     with connect() as db:
         return dict(db.execute("select status, count(*) from messages group by status").fetchall())
+
+
+def get_message(message_id):
+    with connect() as db:
+        return db.execute("select * from messages where id = ?", [message_id]).fetchone()
 
 
 def app_shell(title, active, content):
@@ -393,8 +413,21 @@ article.mail {{
   padding: 14px;
 }}
 .mail h2 {{ margin: 0 0 6px; font-size: 17px; line-height: 1.25; overflow-wrap: anywhere; }}
+.mail h2 a {{ color: var(--text); text-decoration: none; }}
+.mail h2 a:hover {{ color: var(--brand); text-decoration: underline; }}
 .meta {{ color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }}
 .snippet {{ margin: 10px 0; color: #394655; }}
+.message-title {{ margin: 0 0 8px; font-size: 24px; line-height: 1.2; overflow-wrap: anywhere; }}
+.message-body {{
+  margin: 18px 0 0;
+  padding-top: 18px;
+  border-top: 1px solid var(--line);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #263443;
+}}
+.detail-actions {{ display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-top: 16px; flex-wrap: wrap; }}
+.back {{ color: var(--brand); text-decoration: none; font-weight: 600; }}
 .labels {{ display: flex; gap: 6px; flex-wrap: wrap; }}
 .label, .score {{
   display: inline-flex;
@@ -444,6 +477,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/priorities":
             self.priorities_page()
+            return
+        if parsed.path == "/message":
+            qs = parse_qs(parsed.query)
+            self.message_page(qs.get("id", [""])[0])
             return
         self.send_error(404)
 
@@ -510,6 +547,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(doc.encode())
 
+    def message_page(self, message_id):
+        row = get_message(message_id)
+        if not row:
+            self.send_error(404)
+            return
+        labels = "".join(f'<span class="label">{html.escape(label)}</span>' for label in json.loads(row["labels"]))
+        content = f"""
+<section class="panel">
+  <a class="back" href="/">Back to queue</a>
+  <h2 class="message-title">{html.escape(row['subject'])}</h2>
+  <div class="meta">{html.escape(row['sender'])} · {html.escape(row['sent_at'])}<span class="score">score {row['score']}</span></div>
+  <div class="labels">{labels}</div>
+  <div class="message-body">{html.escape(row['body'] or row['snippet'])}</div>
+  <div class="detail-actions">
+    <a class="back" href="/">Back to queue</a>
+    <form method="post" action="/done">
+      <input type="hidden" name="id" value="{html.escape(row['id'])}">
+      <button>Mark done</button>
+    </form>
+  </div>
+</section>
+"""
+        doc = app_shell("Full message", "queue", content)
+        self.send_response(200)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(doc.encode())
+
     def priorities_page(self):
         saved = "saved=1" in self.path
         priorities = html.escape(priorities_from_rules(load_rules()))
@@ -536,12 +601,14 @@ class Handler(BaseHTTPRequestHandler):
 
 def card(row):
     labels = "".join(f'<span class="label">{html.escape(label)}</span>' for label in json.loads(row["labels"]))
+    local_href = f"/message?id={quote(row['id'], safe='')}"
+    href = row["url"] or gmail_url(row["id"]) or local_href
     return f"""<article class="mail">
   <div>
-    <h2>{html.escape(row['subject'])}</h2>
+    <h2><a href="{html.escape(href)}" target="_blank" rel="noreferrer">{html.escape(row['subject'])}</a></h2>
     <div class="meta">{html.escape(row['sender'])} · {html.escape(row['sent_at'])}<span class="score">score {row['score']}</span></div>
     <p class="snippet">{html.escape(row['snippet'])}</p>
-    <div class="labels">{labels}</div>
+    <div class="labels">{labels}<a class="label" href="{html.escape(local_href)}">stored text</a></div>
   </div>
   <form method="post" action="/done">
     <input type="hidden" name="id" value="{html.escape(row['id'])}">

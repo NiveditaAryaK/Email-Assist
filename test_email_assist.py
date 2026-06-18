@@ -18,6 +18,8 @@ def test_interview_message_is_important():
     mail = email_assist.parse_message(RAW, rules)
     assert mail["labels"] == ["interview"]
     assert mail["score"] == 8
+    assert "Please accept the calendar invite." in mail["body"]
+    assert mail["url"].startswith("https://mail.google.com/mail/u/0/#search/rfc822msgid%3A")
 
 
 def test_load_env_sets_missing_values_only():
