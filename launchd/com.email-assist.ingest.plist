@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.email-assist.ingest</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+    <string>/Users/n12/email_assist/email_assist.py</string>
+    <string>sync</string>
+    <string>--since</string>
+    <string>2026-06-01</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/n12/email_assist</string>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>0</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/n12/email_assist/logs/ingest.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/n12/email_assist/logs/ingest.err.log</string>
+</dict>
+</plist>

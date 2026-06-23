@@ -45,9 +45,20 @@ def test_missing_nltk_is_not_fatal():
     assert isinstance(email_assist.nltk_synonyms("interview"), list)
 
 
+def test_imap_since_uses_imap_date_format():
+    assert email_assist.imap_since("2026-06-01") == "01-Jun-2026"
+
+
+def test_agent_can_list_priorities_tool():
+    output = email_assist.execute_agent_tool("list_priorities", {})
+    assert "priorities" in output
+
+
 if __name__ == "__main__":
     test_interview_message_is_important()
     test_load_env_sets_missing_values_only()
     test_priorities_become_ordered_rules()
     test_missing_nltk_is_not_fatal()
+    test_imap_since_uses_imap_date_format()
+    test_agent_can_list_priorities_tool()
     print("ok")

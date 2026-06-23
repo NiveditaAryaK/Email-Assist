@@ -7,6 +7,8 @@ import json
 import os
 import re
 import sqlite3
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from email.header import decode_header, make_header
 from email.utils import parsedate_to_datetime
@@ -17,6 +19,8 @@ from urllib.parse import parse_qs, quote, urlparse
 DB = Path(os.environ.get("EMAIL_ASSIST_DB", "email_assist.sqlite3"))
 RULES = Path(os.environ.get("EMAIL_ASSIST_RULES", "rules.json"))
 ENV = Path(os.environ.get("EMAIL_ASSIST_ENV", ".env"))
+OLLAMA_URL = os.environ.get("EMAIL_ASSIST_OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
+AI_MODEL = os.environ.get("EMAIL_ASSIST_AI_MODEL", "qwen2.5:3b")
 STOPWORDS = {
     "a", "an", "and", "any", "for", "from", "his", "her", "important", "mail", "mails",
     "me", "my", "of", "or", "the", "to", "with",
@@ -267,7 +271,17 @@ def rescore_messages(rules):
         db.commit()
 
 
-def sync_imap(limit):
+def imap_since(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as exc:
+        raise SystemExit("Use --since as YYYY-MM-DD, for example 2026-06-01.") from exc
+    return parsed.strftime("%d-%b-%Y")
+
+
+def sync_imap(limit=None, since=None, full=False):
     load_env()
     host = os.environ.get("EMAIL_IMAP_HOST")
     user = os.environ.get("EMAIL_IMAP_USER")
@@ -277,25 +291,37 @@ def sync_imap(limit):
         raise SystemExit("Set EMAIL_IMAP_HOST, EMAIL_IMAP_USER, and EMAIL_IMAP_PASSWORD.")
 
     rules = load_rules()
-    client = imaplib.IMAP4_SSL(host)
+    client = imaplib.IMAP4_SSL(host, timeout=60)
     try:
         client.login(user, password)
         client.select(folder)
-        typ, data = client.search(None, "ALL")
+        criteria = ["SINCE", imap_since(since)] if since else ["ALL"]
+        typ, data = client.search(None, *criteria)
         if typ != "OK":
             raise SystemExit("IMAP search failed.")
-        ids = data[0].split()[-limit:]
+        ids = data[0].split()
+        if limit:
+            ids = ids[-limit:]
+        total = len(ids)
+        print(f"Found {total} messages" + (f" since {since}" if since else "") + ".", flush=True)
         messages = []
-        for msg_id in ids:
-            typ, fetched = client.fetch(msg_id, "(RFC822)")
+        parts = "(RFC822)" if full else "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID FROM SUBJECT DATE)])"
+        for index, msg_id in enumerate(ids, 1):
+            typ, fetched = client.fetch(msg_id, parts)
             if typ == "OK" and fetched and isinstance(fetched[0], tuple):
                 messages.append(parse_message(fetched[0][1], rules))
+            if index % 100 == 0:
+                print(f"Fetched {index}/{total} messages.", flush=True)
     finally:
-        client.logout()
+        try:
+            client.logout()
+        except imaplib.IMAP4.error:
+            pass
 
     with connect() as db:
         save_messages(db, messages)
-    print(f"Synced {len(messages)} messages; saved important matches.")
+    window = f" since {since}" if since else ""
+    print(f"Synced {len(messages)} messages{window}; saved important matches.")
 
 
 def init_files():
@@ -353,8 +379,184 @@ def get_message(message_id):
         return db.execute("select * from messages where id = ?", [message_id]).fetchone()
 
 
+def agent_tools():
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "list_priorities",
+                "description": "List the user's current email priorities.",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "add_priority",
+                "description": "Add a user priority chip and rescore saved mail.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"priority": {"type": "string"}},
+                    "required": ["priority"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "delete_priority",
+                "description": "Remove a user priority chip and rescore saved mail.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"priority": {"type": "string"}},
+                    "required": ["priority"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_mail",
+                "description": "Search captured important mail by sender, subject, snippet, or label.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "status": {"type": "string", "enum": ["new", "done"]},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "mark_done",
+                "description": "Mark a captured message as done by message id.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"message_id": {"type": "string"}},
+                    "required": ["message_id"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "sync_mail",
+                "description": "Sync mail from IMAP. Use since as YYYY-MM-DD. Limit is optional.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "since": {"type": "string"},
+                        "limit": {"type": "integer"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    ]
+
+
+def execute_agent_tool(name, args):
+    args = args or {}
+    if name == "list_priorities":
+        return {"priorities": load_priority_labels()}
+    if name == "add_priority":
+        add_priority(args["priority"])
+        return {"ok": True, "priorities": load_priority_labels()}
+    if name == "delete_priority":
+        delete_priority(args["priority"])
+        return {"ok": True, "priorities": load_priority_labels()}
+    if name == "search_mail":
+        limit = min(int(args.get("limit", 10)), 25)
+        found = rows(args.get("status", "new"), args.get("query", ""))[:limit]
+        return {
+            "messages": [
+                {
+                    "id": row["id"],
+                    "subject": row["subject"],
+                    "sender": row["sender"],
+                    "sent_at": row["sent_at"],
+                    "labels": json.loads(row["labels"]),
+                    "score": row["score"],
+                    "gmail_url": row["url"] or gmail_url(row["id"]),
+                }
+                for row in found
+            ]
+        }
+    if name == "mark_done":
+        with connect() as db:
+            db.execute("update messages set status = 'done' where id = ?", [args["message_id"]])
+            db.commit()
+        return {"ok": True}
+    if name == "sync_mail":
+        sync_imap(args.get("limit"), args.get("since"))
+        return {"ok": True}
+    return {"error": f"Unknown tool: {name}"}
+
+
+def ollama_chat(messages):
+    load_env()
+    payload = {
+        "model": os.environ.get("EMAIL_ASSIST_AI_MODEL", AI_MODEL),
+        "messages": messages,
+        "tools": agent_tools(),
+        "stream": False,
+    }
+    request = urllib.request.Request(
+        os.environ.get("EMAIL_ASSIST_OLLAMA_URL", OLLAMA_URL),
+        data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            return json.loads(response.read())
+    except urllib.error.URLError as exc:
+        raise SystemExit(
+            "Local AI model is not reachable. Start Ollama and run: "
+            "ollama pull qwen2.5:3b"
+        ) from exc
+
+
+def run_agent(prompt):
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are Email Assist, a local inbox triage agent. Use tools when you need "
+                "current inbox data or need to change priorities/status. Be concise. When "
+                "showing mail, include subject, sender, why it matters, and Gmail URL."
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    for _ in range(5):
+        result = ollama_chat(messages)
+        message = result.get("message", {})
+        messages.append(message)
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return message.get("content", "")
+        for call in tool_calls:
+            function = call.get("function", {})
+            name = function.get("name")
+            args = function.get("arguments") or {}
+            if isinstance(args, str):
+                args = json.loads(args)
+            output = execute_agent_tool(name, args)
+            messages.append({
+                "role": "tool",
+                "name": name,
+                "content": json.dumps(output),
+            })
+    return "I stopped after too many tool calls. Try a narrower request."
+
+
 def app_shell(title, active, content):
     queue_class = "active" if active == "queue" else ""
+    agent_class = "active" if active == "agent" else ""
     return f"""<!doctype html>
 <html lang="en">
 <meta charset="utf-8">
@@ -514,6 +716,15 @@ article.mail {{
 .hint {{ color: var(--muted); margin-top: 0; }}
 .save-row {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; flex-wrap: wrap; }}
 .saved {{ color: var(--ok); font-weight: 600; }}
+.agent-box {{ display: grid; gap: 12px; }}
+.agent-box textarea {{ min-height: 120px; }}
+.agent-answer {{
+  white-space: pre-wrap;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfd;
+  padding: 14px;
+}}
 @media (max-width: 720px) {{
   .app {{ padding: 16px; }}
   .topbar, .toolbar, .priority-form {{ display: grid; grid-template-columns: 1fr; align-items: stretch; }}
@@ -531,6 +742,7 @@ article.mail {{
     </div>
     <nav aria-label="Primary">
       <a class="{queue_class}" href="/">Queue</a>
+      <a class="{agent_class}" href="/agent">Agent</a>
     </nav>
   </header>
   {content}
@@ -552,6 +764,9 @@ class Handler(BaseHTTPRequestHandler):
             qs = parse_qs(parsed.query)
             self.message_page(qs.get("id", [""])[0])
             return
+        if parsed.path == "/agent":
+            self.agent_page()
+            return
         self.send_error(404)
 
     def do_POST(self):
@@ -567,6 +782,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if parsed.path == "/priority/delete":
             self.delete_priority()
+            return
+        if parsed.path == "/agent":
+            self.agent_chat()
             return
         self.send_error(404)
 
@@ -676,6 +894,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(doc.encode())
 
+    def agent_page(self, prompt="", answer=""):
+        answer_html = f'<div class="agent-answer">{html.escape(answer)}</div>' if answer else ""
+        content = f"""
+<section class="panel agent-box">
+  <h2>Agent chat</h2>
+  <p class="hint">Ask it to find mail, update priorities, mark items done, or sync mail. It uses local Ollama tool calling.</p>
+  <form class="agent-box" method="post" action="/agent">
+    <textarea name="prompt" placeholder="Find interview emails I have not handled yet">{html.escape(prompt)}</textarea>
+    <button>Ask agent</button>
+  </form>
+  {answer_html}
+</section>
+"""
+        doc = app_shell("Tool-calling email agent", "agent", content)
+        self.send_response(200)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(doc.encode())
+
+    def agent_chat(self):
+        length = int(self.headers.get("content-length", "0"))
+        prompt = parse_qs(self.rfile.read(length).decode()).get("prompt", [""])[0]
+        try:
+            answer = run_agent(prompt)
+        except SystemExit as exc:
+            answer = str(exc)
+        self.agent_page(prompt, answer)
+
     def priorities_page(self):
         saved = "saved=1" in self.path
         priorities = html.escape(priorities_from_rules(load_rules()))
@@ -754,18 +1000,24 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init")
     sync = sub.add_parser("sync")
-    sync.add_argument("--limit", type=int, default=100)
+    sync.add_argument("--limit", type=int)
+    sync.add_argument("--since")
+    sync.add_argument("--full", action="store_true", help="Fetch full message bodies instead of headers only.")
     serve_cmd = sub.add_parser("serve")
     serve_cmd.add_argument("--port", type=int, default=8765)
+    agent = sub.add_parser("agent")
+    agent.add_argument("prompt")
     sub.add_parser("demo")
     args = parser.parse_args()
 
     if args.cmd == "init":
         init_files()
     elif args.cmd == "sync":
-        sync_imap(args.limit)
+        sync_imap(args.limit, args.since, args.full)
     elif args.cmd == "serve":
         serve(args.port)
+    elif args.cmd == "agent":
+        print(run_agent(args.prompt))
     elif args.cmd == "demo":
         demo()
 

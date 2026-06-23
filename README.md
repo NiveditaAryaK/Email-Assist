@@ -70,6 +70,67 @@ python3 email_assist.py sync --limit 100
 python3 email_assist.py serve
 ```
 
+Ingest everything from June 1, 2026 onward:
+
+```bash
+python3 email_assist.py sync --since 2026-06-01
+```
+
+By default sync fetches headers only and opens the original mail in Gmail. If you also want the local `stored text` fallback populated with full message bodies, run:
+
+```bash
+python3 email_assist.py sync --since 2026-06-01 --full
+```
+
+## Daily Ingestion
+
+The macOS LaunchAgent template is in [launchd/com.email-assist.ingest.plist](launchd/com.email-assist.ingest.plist). It runs this every day at midnight:
+
+```bash
+python3 email_assist.py sync --since 2026-06-01
+```
+
+Logs are written to:
+
+```text
+logs/ingest.out.log
+logs/ingest.err.log
+```
+
+## Local AI Agent
+
+Email Assist can use a local open-source model through Ollama tool calling. Recommended starter model:
+
+```bash
+ollama pull qwen2.5:3b
+```
+
+Then start the dashboard and open `Agent`:
+
+```bash
+python3 email_assist.py serve
+```
+
+You can also ask from the terminal:
+
+```bash
+python3 email_assist.py agent "Find new interview emails and show Gmail links"
+```
+
+The agent can call tools to:
+
+- list, add, and remove priority chips
+- search captured mail
+- mark a message done
+- sync mail
+
+Optional `.env` settings:
+
+```bash
+EMAIL_ASSIST_AI_MODEL=qwen2.5:3b
+EMAIL_ASSIST_OLLAMA_URL=http://127.0.0.1:11434/api/chat
+```
+
 ## Rules
 
 The dashboard writes [rules.json](rules.json) for you. Each priority chip becomes a JSON rule with a label, score, and regex patterns:
@@ -103,7 +164,7 @@ python3 test_email_assist.py
 ## Current Ceiling
 
 - IMAP only; no Gmail OAuth yet
-- rules-based scoring only; no LLM classification yet
+- local AI agent uses Ollama tool calling; classification still starts from rules
 - NLTK synonyms are optional and depend on local WordNet data
 - local dashboard only; no hosted multi-user app yet
 - simple `.env` parser; use plain `KEY=value` lines
